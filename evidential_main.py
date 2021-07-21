@@ -12,6 +12,7 @@ import os
 import argparse
 
 from models import *
+from evidential_loss import *
 from utils import progress_bar
 
 
@@ -51,7 +52,7 @@ testloader = torch.utils.data.DataLoader(
 
 classes = ('plane', 'car', 'bird', 'cat', 'deer',
            'dog', 'frog', 'horse', 'ship', 'truck')
-
+num_classes = 10
 # Model
 print('==> Building model..')
 # net = VGG('VGG19')
@@ -84,13 +85,15 @@ if args.resume:
     best_acc = checkpoint['acc']
     start_epoch = checkpoint['epoch']
 
-criterion = nn.CrossEntropyLoss()
+#criterion = nn.CrossEntropyLoss()
+criterion = edl_mse_loss
 optimizer = optim.SGD(net.parameters(), lr=args.lr,
                       momentum=0.9, weight_decay=5e-4)
 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=200)
 
 
 # Training
+
 def train(epoch):
     print('\nEpoch: %d' % epoch)
     net.train()
@@ -100,19 +103,40 @@ def train(epoch):
     for batch_idx, (inputs, targets) in enumerate(trainloader):
         inputs, targets = inputs.to(device), targets.to(device)
         optimizer.zero_grad()
+        
+        y = one_hot_embedding(targets.long(), num_classes)
+        y = y.to(device)
         outputs = net(inputs)
-        loss = criterion(outputs, targets)
+        _, preds = torch.max(outputs, 1)
+        loss = criterion(
+            outputs, y.float(), batch_idx, num_classes, 10, device)
+        
+        match = torch.reshape(torch.eq(
+            preds, targets).float(), (-1, 1))
+        acc = torch.mean(match)
+        evidence = squareplus(outputs)
+        alpha = evidence + 1
+        u = num_classes / torch.sum(alpha, dim=1, keepdim=True)
+        
+        total_evidence = torch.sum(evidence, 1, keepdim=True)
+        mean_evidence = torch.mean(total_evidence)
+        mean_evidence_succ = torch.sum(
+            torch.sum(evidence, 1, keepdim=True) * match) / torch.sum(match + 1e-20)
+        mean_evidence_fail = torch.sum(
+            torch.sum(evidence, 1, keepdim=True) * (1 - match)) / (torch.sum(torch.abs(1 - match)) + 1e-20)
+        
+        
         loss.backward()
         optimizer.step()
-
+        
         train_loss += loss.item()
         _, predicted = outputs.max(1)
         total += targets.size(0)
         correct += predicted.eq(targets).sum().item()
-
+        
         progress_bar(batch_idx, len(trainloader), 'Loss: %.3f | Acc: %.3f%% (%d/%d)'
-                     % (train_loss/(batch_idx+1), 100.*correct/total, correct, total))
-
+        	     % (train_loss/(batch_idx+1), 100.*correct/total, correct, total))
+        
 
 def test(epoch):
     global best_acc
@@ -123,8 +147,11 @@ def test(epoch):
     with torch.no_grad():
         for batch_idx, (inputs, targets) in enumerate(testloader):
             inputs, targets = inputs.to(device), targets.to(device)
+            y = one_hot_embedding(targets.long(), num_classes)
+            y = y.to(device)
             outputs = net(inputs)
-            loss = criterion(outputs, targets)
+            loss = criterion(
+                outputs, y.float(), batch_idx, num_classes, 10, device)
 
             test_loss += loss.item()
             _, predicted = outputs.max(1)
